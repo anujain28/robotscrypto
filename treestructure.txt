@@ -1,0 +1,8 @@
+ai-crypto-bot/
+├─ app.py
+├─ config.json              # runtime only
+├─ requirements.txt
+├─ .gitignore
+├─ README.md
+└─ data/
+   └─ coins_watchlist.csv   # like BTC,ETH,SOL,... (optional)
