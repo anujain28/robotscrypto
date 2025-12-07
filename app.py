@@ -313,7 +313,6 @@ def maybe_send_daily_summary(df_signals: pd.DataFrame, usdt_inr: float):
 
     # Bot capital info from My Bot Notes
     total_cap = st.session_state.get("bot_total_cap", None)
-    total_cap_inr = st.session_state.get("bot_total_cap", None)
     total_pnl_usdt = st.session_state.get("bot_total_pnl_usdt", None)
     total_pnl_inr = st.session_state.get("bot_total_pnl_inr", None)
 
@@ -390,6 +389,63 @@ def compute_recommended_ranges(symbol: str):
             "Tight Scalping": (tight_lower, tight_upper),
         },
     }
+
+
+# ---------- RISK SCORE FOR GRID BOT ----------
+
+def compute_risk_score(lower: float, upper: float, sl: float) -> float:
+    """
+    Risk score (0 = safer, 100 = very risky) based on:
+      - Grid width (narrow = higher risk, wide = lower risk)
+      - Stop Loss placement (no SL / SL inside grid = higher risk,
+        SL well below grid = lower risk).
+    """
+    if lower <= 0 or upper <= lower:
+        return float("nan")
+
+    # Width-based component
+    width_pct = (upper - lower) / lower * 100.0  # how wide relative to lower
+    base = 50.0  # medium baseline
+
+    # Narrow range => more risk
+    if width_pct < 5:
+        base += 20
+    elif width_pct < 10:
+        base += 10
+    elif width_pct < 25:
+        base += 0
+    else:
+        base -= 10  # very wide = safer
+
+    # SL component
+    if sl <= 0:  # no SL
+        base += 15
+    else:
+        if sl >= lower:
+            # SL inside or above grid – high risk of stop-out
+            base += 10
+        else:
+            # SL below grid => safer; the farther, the safer (up to a point)
+            buffer_pct = (lower - sl) / lower * 100.0
+            if buffer_pct >= 20:
+                base -= 15
+            elif buffer_pct >= 10:
+                base -= 10
+            elif buffer_pct >= 5:
+                base -= 5
+            # tiny buffer => almost neutral
+
+    return float(max(0.0, min(100.0, base)))
+
+
+def risk_label(score: float) -> str:
+    if np.isnan(score):
+        return "Unknown"
+    if score <= 35:
+        return "Low Risk"
+    if score <= 65:
+        return "Medium Risk"
+    return "High Risk"
 
 
 # ------------------ SIDEBAR NAV ------------------
@@ -517,7 +573,7 @@ def page_grid_planner(usdt_inr: float):
 
     st.markdown(
         "Fill your planned Binance grid parameters here. "
-        "This tool will **check your capital limits** and estimate **potential profit for a full swing**."
+        "This tool will **check your capital limits**, estimate **profit**, and give a **Risk Score**."
     )
 
     col1, col2 = st.columns(2)
@@ -601,6 +657,10 @@ def page_grid_planner(usdt_inr: float):
         capital=per_bot_capital,
     )
 
+    # Risk score
+    risk_score = compute_risk_score(lower_price, upper_price, sl)
+    risk_band = risk_label(risk_score)
+
     st.markdown("### 📌 Bot Summary (per Bot)")
 
     summary_rows = [
@@ -613,6 +673,8 @@ def page_grid_planner(usdt_inr: float):
         {"Metric": "Approx. Price Gap per Grid", "Value": f"{per_grid_price_gap:.2f} USDT"},
         {"Metric": "Capital per Grid (approx)", "Value": fmt_usdt(per_grid_capital)},
         {"Metric": "Capital per Grid (INR approx)", "Value": fmt_inr_compact(per_grid_capital * usdt_inr)},
+        {"Metric": "Risk Score (0=safer, 100=high risk)", "Value": f"{risk_score:.1f}" if not np.isnan(risk_score) else "-"},
+        {"Metric": "Risk Band", "Value": risk_band},
     ]
     if tp > 0:
         summary_rows.append({"Metric": "Take Profit (TP)", "Value": f"{tp:.2f} USDT"})
@@ -657,6 +719,24 @@ def page_grid_planner(usdt_inr: float):
     # Range interpretation from core.grid_engine
     comments.append(describe_grid_width(lower_price, upper_price))
 
+    # Risk band explanation
+    if not np.isnan(risk_score):
+        if risk_band == "Low Risk":
+            comments.append(
+                "Risk band: **Low** – wide grid and/or good SL distance. "
+                "Suitable for calmer, long-running bots."
+            )
+        elif risk_band == "Medium Risk":
+            comments.append(
+                "Risk band: **Medium** – balanced grid width & SL. "
+                "Monitor but generally acceptable for normal volatility."
+            )
+        else:
+            comments.append(
+                "Risk band: **High** – tight range and/or aggressive SL / no SL. "
+                "Use smaller capital or widen the grid for safety."
+            )
+
     # TP / SL comments
     if tp > 0 and tp <= upper_price:
         comments.append("TP is **inside or near the top** of your grid; okay for quick booking.")
@@ -666,6 +746,9 @@ def page_grid_planner(usdt_inr: float):
         comments.append("SL is **inside or above** your grid; high chance of stop-out. Consider placing SL a bit lower.")
     elif sl > 0 and sl < lower_price:
         comments.append("SL is **below your grid**; more room for the bot to work before hard exit.")
+    else:
+        if sl == 0:
+            comments.append("No SL set – this increases risk. Consider at least a deep emergency SL.")
 
     # Bot count & diversification
     if num_bots == 2:
