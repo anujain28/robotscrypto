@@ -4,6 +4,18 @@ import numpy as np
 import requests
 from datetime import datetime, timezone
 
+# ---- Core modules (your new files) ----
+from core.indicators import trend_and_signal
+from core.grid_engine import (
+    check_bot_budget,
+    estimate_grid_cycle_profit,
+    describe_grid_width,
+)
+from core.alerts import (
+    send_telegram_message,
+    prepare_dip_alerts,
+)
+
 # ------------------ CONFIG ------------------
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
@@ -12,6 +24,7 @@ WATCH_COINS = {
     "ethereum": "ETH",
     "solana": "SOL",
 }
+ID_BY_SYMBOL = {sym: cid for cid, sym in WATCH_COINS.items()}
 
 MAX_BOTS = 2
 MAX_PER_BOT = 50.0   # USDT
@@ -125,6 +138,14 @@ if "tg_chat_id" not in st.session_state:
 if "last_alerts" not in st.session_state:
     # { "BTC": "YYYY-MM-DD", ... }
     st.session_state["last_alerts"] = {}
+if "last_daily_summary_date" not in st.session_state:
+    st.session_state["last_daily_summary_date"] = ""
+if "bot_total_cap" not in st.session_state:
+    st.session_state["bot_total_cap"] = None
+if "bot_total_pnl_usdt" not in st.session_state:
+    st.session_state["bot_total_pnl_usdt"] = None
+if "bot_total_pnl_inr" not in st.session_state:
+    st.session_state["bot_total_pnl_inr"] = None
 
 # ------------------ HELPERS ------------------
 
@@ -195,99 +216,6 @@ def fetch_price_history(coin_id: str, days: int = 30) -> pd.Series:
         return pd.Series(dtype=float)
 
 
-def compute_rsi(series: pd.Series, period: int = 14) -> float:
-    """Classic RSI implementation."""
-    if series is None or len(series) < period + 1:
-        return np.nan
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
-
-
-def compute_ema(series: pd.Series, span: int) -> float:
-    if series is None or len(series) < span:
-        return np.nan
-    ema = series.ewm(span=span, adjust=False).mean()
-    return float(ema.iloc[-1])
-
-
-def trend_and_signal(price_series: pd.Series, symbol: str) -> dict:
-    """Return trend, RSI, EMAs and AI-style signal."""
-    info = {
-        "symbol": symbol,
-        "trend": "Unknown",
-        "rsi": np.nan,
-        "ema50": np.nan,
-        "ema200": np.nan,
-        "signal": "No data",
-        "comment": "",
-        "score": 0,
-    }
-    if price_series is None or price_series.empty:
-        info["comment"] = "No price history from API."
-        return info
-
-    close = price_series
-    last_price = float(close.iloc[-1])
-    rsi_val = compute_rsi(close, period=14)
-    ema50 = compute_ema(close, span=50)
-    ema200 = compute_ema(close, span=200)
-
-    info["rsi"] = rsi_val
-    info["ema50"] = ema50
-    info["ema200"] = ema200
-
-    # Trend classification
-    if np.isnan(ema200):
-        trend = "Sideways / Short History"
-    elif last_price > ema200 * 1.02 and ema50 > ema200:
-        trend = "Uptrend"
-    elif abs(last_price - ema200) / ema200 <= 0.03:
-        trend = "Sideways"
-    else:
-        trend = "Downtrend"
-    info["trend"] = trend
-
-    # Simple dip / FOMO logic
-    comment_parts = []
-
-    # RSI logic
-    if rsi_val <= 35:
-        signal = "Buy on Dips (Oversold)"
-        score = 90
-        comment_parts.append("Price in oversold zone; good area to accumulate in grids.")
-    elif 35 < rsi_val <= 55:
-        signal = "Accumulation Zone"
-        score = 80
-        comment_parts.append("Healthy RSI; staggered buying with grids is sensible.")
-    elif 55 < rsi_val <= 70:
-        signal = "Hold / Wait for Dip"
-        score = 60
-        comment_parts.append("Momentum is up; wait for pullback before fresh grids.")
-    else:
-        signal = "Avoid New Buys (Overbought)"
-        score = 40
-        comment_parts.append("RSI is overheated; avoid chasing, set wider lower grids.")
-
-    # Trend bonus / penalty
-    if trend == "Uptrend":
-        score += 10
-        comment_parts.append("Higher time-frame trend is positive.")
-    elif trend == "Downtrend":
-        score -= 15
-        comment_parts.append("Macro trend weak; use very conservative grids.")
-
-    score = max(0, min(100, score))
-    info["signal"] = signal
-    info["comment"] = " ".join(comment_parts)
-    info["score"] = int(score)
-    info["last_price"] = last_price
-    return info
-
-
 def fmt_usdt(x: float) -> str:
     if np.isnan(x):
         return "-"
@@ -316,62 +244,11 @@ def fmt_pct(x: float) -> str:
     return f"{x:.2f}%"
 
 
-def check_bot_budget(num_bots: int, per_bot: float) -> dict:
-    total = num_bots * per_bot
-    ok = True
-    msgs = []
-    if num_bots > MAX_BOTS:
-        ok = False
-        msgs.append(f"❌ Max {MAX_BOTS} bots allowed.")
-    if per_bot > MAX_PER_BOT:
-        ok = False
-        msgs.append(f"❌ Per bot limit is {MAX_PER_BOT} USDT. You entered {per_bot:.2f}.")
-    if total > MAX_TOTAL:
-        ok = False
-        msgs.append(f"❌ Total allocation cannot exceed {MAX_TOTAL} USDT. You entered {total:.2f}.")
-    if ok:
-        msgs.append(f"✅ Budget OK: {num_bots} bot(s) × {per_bot:.2f} USDT = {total:.2f} USDT.")
-    return {"ok": ok, "total": total, "messages": msgs}
-
-
-def estimate_grid_cycle_profit(lower: float, upper: float, grids: int, capital: float) -> dict:
-    """
-    Very rough approximation of full up-move profit in a classic buy-low/sell-high grid.
-    Assumes equal capital per grid and one round-trip per level.
-    """
-    if lower <= 0 or upper <= lower or grids <= 0 or capital <= 0:
-        return {
-            "gross_profit": np.nan,
-            "roi_pct": np.nan,
-            "avg_price": np.nan,
-        }
-    price_range = upper - lower
-    avg_price = (upper + lower) / 2
-    # Theoretical ROI approx for 1 full swing through range:
-    roi_pct = (price_range / avg_price) * 2 * 100  # 2x for multiple scalps
-    gross_profit = capital * roi_pct / 100.0
-    return {
-        "gross_profit": gross_profit,
-        "roi_pct": roi_pct,
-        "avg_price": avg_price,
-    }
-
-
-# ------------------ TELEGRAM HELPERS ------------------
-
-def send_telegram_message(token: str, chat_id: str, text: str):
-    if not token or not chat_id:
-        return None
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        r = requests.get(url, params={"chat_id": chat_id, "text": text}, timeout=10)
-        return r.json()
-    except Exception:
-        return None
-
-
 def maybe_send_dip_alerts(df_signals: pd.DataFrame, usdt_inr: float):
-    """Send Telegram alerts when coins enter Buy on Dips / RSI<=35. One alert per coin per day."""
+    """
+    Use core.alerts.prepare_dip_alerts + send_telegram_message
+    to fire dip alerts (RSI<=35 / Buy on Dips) – once per coin per day.
+    """
     if not st.session_state.get("alerts_enabled", False):
         return
 
@@ -381,41 +258,138 @@ def maybe_send_dip_alerts(df_signals: pd.DataFrame, usdt_inr: float):
         return
 
     last_alerts = st.session_state.get("last_alerts", {}) or {}
+    alerts, new_state = prepare_dip_alerts(df_signals, usdt_inr, last_alerts)
+
+    if alerts:
+        for a in alerts:
+            send_telegram_message(token, chat_id, a.text)
+        st.session_state["last_alerts"] = new_state
+        st.caption("📤 Telegram dip alerts sent for: " + ", ".join(a.symbol for a in alerts))
+
+
+def maybe_send_daily_summary(df_signals: pd.DataFrame, usdt_inr: float):
+    """
+    Send ONE daily summary message (all three coins + bot allocation)
+    when user opens Market Overview and Telegram alerts are enabled.
+    """
+    if not st.session_state.get("alerts_enabled", False):
+        return
+
+    token = st.session_state.get("tg_token", "")
+    chat_id = st.session_state.get("tg_chat_id", "")
+    if not token or not chat_id:
+        return
+
     today_str = datetime.now().strftime("%Y-%m-%d")
-    alerted_coins = []
+    last_date = st.session_state.get("last_daily_summary_date", "")
+    if last_date == today_str:
+        return
+
+    if df_signals is None or df_signals.empty:
+        return
+
+    lines = []
+    lines.append("📊 Daily Crypto Grid Summary")
+    lines.append(today_str)
+    lines.append("")
 
     for _, r in df_signals.iterrows():
         symbol = r.get("symbol", "")
+        price = r.get("price", np.nan)
+        price_inr = r.get("price_inr", np.nan)
         rsi = r.get("rsi", np.nan)
         signal = r.get("signal", "")
-        price = r.get("price", np.nan)
+        change = r.get("change_24h", np.nan)
 
-        if symbol == "" or np.isnan(rsi) or np.isnan(price):
+        if not symbol or np.isnan(price):
             continue
 
-        # Dip condition
-        if rsi <= 35 or "Buy on Dips" in str(signal):
-            last_for_coin = last_alerts.get(symbol)
-            if last_for_coin == today_str:
-                continue  # already alerted today
+        lines.append(
+            f"{symbol}: {price:.2f} USDT "
+            f"(≈ {fmt_inr_compact(price_inr)}) | "
+            f"24h: {fmt_pct(change)} | RSI: {rsi:.1f} | {signal}"
+        )
+    lines.append("")
 
-            price_inr = price * usdt_inr
-            msg = (
-                f"🪙 Dip Alert for {symbol}\n"
-                f"Price: {price:.2f} USDT ({fmt_inr_compact(price_inr)})\n"
-                f"RSI(14): {rsi:.1f}\n"
-                f"Trend: {r.get('trend','Unknown')}\n"
-                f"Signal: {signal}\n\n"
-                f"Bias: Good zone for **grid accumulation**, stick to max 50 USDT per bot & total 100 USDT."
+    # Bot capital info from My Bot Notes
+    total_cap = st.session_state.get("bot_total_cap", None)
+    total_cap_inr = st.session_state.get("bot_total_cap", None)
+    total_pnl_usdt = st.session_state.get("bot_total_pnl_usdt", None)
+    total_pnl_inr = st.session_state.get("bot_total_pnl_inr", None)
+
+    lines.append("🤖 Bot Allocation (Manual Notes)")
+    if total_cap is None:
+        lines.append("No bot notes logged yet in app.")
+    else:
+        lines.append(
+            f"Total capital logged: {total_cap:.2f} USDT "
+            f"(≈ {fmt_inr_compact(total_cap * usdt_inr)})"
+        )
+        lines.append(
+            f"Soft limit: {MAX_TOTAL:.2f} USDT "
+            f"({total_cap / MAX_TOTAL * 100:.1f}% used)"
+        )
+        if total_pnl_usdt is not None:
+            lines.append(
+                f"Approx Unrealized P&L: {total_pnl_usdt:.2f} USDT "
+                f"(≈ {fmt_inr_compact(total_pnl_inr)})"
             )
-            send_telegram_message(token, chat_id, msg)
-            last_alerts[symbol] = today_str
-            alerted_coins.append(symbol)
 
-    if alerted_coins:
-        st.caption("📤 Telegram dip alerts sent for: " + ", ".join(alerted_coins))
+    lines.append("")
+    lines.append("#DailySummary #GridBot #BTC #ETH #SOL")
 
-    st.session_state["last_alerts"] = last_alerts
+    text = "\n".join(lines)
+    send_telegram_message(token, chat_id, text)
+    st.session_state["last_daily_summary_date"] = today_str
+    st.caption("📤 Daily Telegram summary sent.")
+
+
+def compute_recommended_ranges(symbol: str):
+    """
+    Compute three suggested ranges (Wide/Swing, Normal, Tight Scalping)
+    based on last 30 days volatility for the selected coin.
+    """
+    coin_id = ID_BY_SYMBOL.get(symbol)
+    if not coin_id:
+        return None
+
+    series = fetch_price_history(coin_id, days=30)
+    if series is None or series.empty:
+        return None
+
+    close = float(series.iloc[-1])
+    hi = float(series.max())
+    lo = float(series.min())
+    mean_price = float(series.mean()) if series.mean() != 0 else close
+
+    vol_pct = (hi - lo) / mean_price if mean_price > 0 else 0.0
+
+    # Base band depending on volatility
+    if vol_pct < 0.25:        # low vol
+        base_down, base_up = 0.12, 0.08
+    elif vol_pct < 0.5:       # medium vol
+        base_down, base_up = 0.18, 0.12
+    else:                     # very volatile
+        base_down, base_up = 0.25, 0.18
+
+    def band(mult_down: float, mult_up: float):
+        lower = close * (1 - base_down * mult_down)
+        upper = close * (1 + base_up * mult_up)
+        return round(lower, 2), round(upper, 2)
+
+    wide_lower, wide_upper = band(1.0, 1.0)    # safer / swing
+    norm_lower, norm_upper = band(0.7, 0.6)    # balanced
+    tight_lower, tight_upper = band(0.4, 0.4)  # scalping
+
+    return {
+        "price": close,
+        "vol_pct": vol_pct * 100,
+        "ranges": {
+            "Wide / Swing (safer)": (wide_lower, wide_upper),
+            "Normal Grid": (norm_lower, norm_upper),
+            "Tight Scalping": (tight_lower, tight_upper),
+        },
+    }
 
 
 # ------------------ SIDEBAR NAV ------------------
@@ -459,12 +433,26 @@ def page_market_overview(usdt_inr: float):
     rows = []
     for cid, symbol in WATCH_COINS.items():
         price_series = fetch_price_history(cid, days=30)
-        info = trend_and_signal(price_series, symbol)
+        sig = trend_and_signal(price_series, symbol)  # from core.indicators
+
         p = prices.get(symbol, {})
-        info["price"] = p.get("price", np.nan)
-        info["change_24h"] = p.get("change_24h", np.nan)
-        info["price_inr"] = info["price"] * usdt_inr if not np.isnan(info["price"]) else np.nan
-        rows.append(info)
+        price_usdt = float(p.get("price", np.nan))
+
+        row = {
+            "symbol": sig.symbol,
+            "trend": sig.trend,
+            "rsi": sig.rsi,
+            "ema50": sig.ema50,
+            "ema200": sig.ema200,
+            "signal": sig.signal,
+            "comment": sig.comment,
+            "score": sig.score,
+            "last_price": sig.last_price,
+            "price": price_usdt,
+            "change_24h": float(p.get("change_24h", np.nan)),
+        }
+        row["price_inr"] = row["price"] * usdt_inr if not np.isnan(row["price"]) else np.nan
+        rows.append(row)
 
     df = pd.DataFrame(rows)
 
@@ -520,6 +508,9 @@ def page_market_overview(usdt_inr: float):
     # 🔔 Telegram dip alerts (RSI <= 35 / Buy on Dips)
     maybe_send_dip_alerts(df_sorted, usdt_inr)
 
+    # 📬 Daily summary (once per day)
+    maybe_send_daily_summary(df_sorted, usdt_inr)
+
 
 def page_grid_planner(usdt_inr: float):
     st.subheader("🤖 Grid Bot Planner – Buy on Dips, Book Profits on Spikes")
@@ -547,18 +538,54 @@ def page_grid_planner(usdt_inr: float):
         tp = st.number_input("Take Profit Price (optional, USDT)", min_value=0.0, value=0.0, step=10.0)
         sl = st.number_input("Stop Loss Price (optional, USDT)", min_value=0.0, value=0.0, step=10.0)
 
+    # 🔮 Recommended ranges based on volatility
+    st.markdown("### 🎯 AI Suggested Grid Ranges (based on last 30 days)")
+    rec = compute_recommended_ranges(coin)
+    if rec is None:
+        st.info("Could not fetch enough data for recommended ranges. Try again later.")
+    else:
+        rows = []
+        for label, (lo, hi) in rec["ranges"].items():
+            rows.append(
+                {
+                    "Preset": label,
+                    "Lower (USDT)": f"{lo:.2f}",
+                    "Upper (USDT)": f"{hi:.2f}",
+                }
+            )
+        rec_df = pd.DataFrame(rows)
+        st.markdown(
+            f"Reference price: **{rec['price']:.2f} USDT** • "
+            f"30-day swing ≈ **{rec['vol_pct']:.1f}%**",
+        )
+        st.markdown(
+            rec_df.to_html(classes="dark-table", index=False, escape=False),
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "You can manually copy any of these ranges into the inputs above. "
+            "For safer bots, prefer **Wide / Swing**; for fast scalping, use **Tight**."
+        )
+
     st.markdown("---")
 
-    budget_info = check_bot_budget(num_bots, per_bot_capital)
-    total_capital = budget_info["total"]
+    # Budget check via core.grid_engine
+    budget = check_bot_budget(
+        num_bots=num_bots,
+        per_bot=per_bot_capital,
+        max_bots=MAX_BOTS,
+        max_per_bot=MAX_PER_BOT,
+        max_total=MAX_TOTAL,
+    )
+    total_capital = budget.total
 
-    if budget_info["ok"]:
-        st.markdown(f"<span class='ok-badge'>{budget_info['messages'][-1]}</span>", unsafe_allow_html=True)
-        if len(budget_info["messages"]) > 1:
-            for m in budget_info["messages"][:-1]:
+    if budget.ok:
+        st.markdown(f"<span class='ok-badge'>{budget.messages[-1]}</span>", unsafe_allow_html=True)
+        if len(budget.messages) > 1:
+            for m in budget.messages[:-1]:
                 st.caption(m)
     else:
-        for m in budget_info["messages"]:
+        for m in budget.messages:
             st.markdown(f"<span class='warn-badge'>{m}</span>", unsafe_allow_html=True)
         st.stop()
 
@@ -567,7 +594,12 @@ def page_grid_planner(usdt_inr: float):
     grid_width = upper_price - lower_price
     per_grid_price_gap = grid_width / grid_count if grid_count > 0 else 0.0
 
-    est = estimate_grid_cycle_profit(lower_price, upper_price, grid_count, per_bot_capital)
+    est = estimate_grid_cycle_profit(
+        lower=lower_price,
+        upper=upper_price,
+        grids=grid_count,
+        capital=per_bot_capital,
+    )
 
     st.markdown("### 📌 Bot Summary (per Bot)")
 
@@ -577,7 +609,7 @@ def page_grid_planner(usdt_inr: float):
         {"Metric": "Capital per Bot (INR approx)", "Value": fmt_inr_compact(per_bot_capital * usdt_inr)},
         {"Metric": "Number of Grids", "Value": f"{grid_count}"},
         {"Metric": "Grid Price Range", "Value": f"{lower_price:.2f} – {upper_price:.2f} USDT"},
-        {"Metric": "Average Price in Range", "Value": f"{est['avg_price']:.2f} USDT" if not np.isnan(est["avg_price"]) else "-"},
+        {"Metric": "Average Price in Range", "Value": f"{est.avg_price:.2f} USDT" if not np.isnan(est.avg_price) else "-"},
         {"Metric": "Approx. Price Gap per Grid", "Value": f"{per_grid_price_gap:.2f} USDT"},
         {"Metric": "Capital per Grid (approx)", "Value": fmt_usdt(per_grid_capital)},
         {"Metric": "Capital per Grid (INR approx)", "Value": fmt_inr_compact(per_grid_capital * usdt_inr)},
@@ -592,22 +624,22 @@ def page_grid_planner(usdt_inr: float):
 
     st.markdown("### 📈 Estimated Profit Potential (Per Bot, Full Swing)")
 
-    if np.isnan(est["gross_profit"]):
+    if np.isnan(est.gross_profit):
         st.warning("Check that lower < upper, grids > 0, and capital > 0.")
     else:
         profit_table = pd.DataFrame(
             [
                 {
                     "Metric": "Approx. Gross Profit for 1 Full Range Cycle",
-                    "Value": fmt_usdt(est["gross_profit"]),
+                    "Value": fmt_usdt(est.gross_profit),
                 },
                 {
                     "Metric": "Approx. Gross Profit (INR)",
-                    "Value": fmt_inr_compact(est["gross_profit"] * usdt_inr),
+                    "Value": fmt_inr_compact(est.gross_profit * usdt_inr),
                 },
                 {
                     "Metric": "Approx. ROI per Full Range Cycle",
-                    "Value": fmt_pct(est["roi_pct"]),
+                    "Value": fmt_pct(est.roi_pct),
                 },
             ]
         )
@@ -622,17 +654,8 @@ def page_grid_planner(usdt_inr: float):
 
     comments = []
 
-    # Range sanity
-    if upper_price <= lower_price:
-        comments.append("❌ Upper price must be **greater** than lower price. Adjust the range.")
-    else:
-        width_pct = (upper_price - lower_price) / lower_price * 100 if lower_price > 0 else 0
-        if width_pct < 5:
-            comments.append("Range is very **tight** (<5%). Good for scalp trading but more sensitive to whipsaws.")
-        elif width_pct < 25:
-            comments.append("Range is **medium width**; decent balance of safety and opportunity.")
-        else:
-            comments.append("Range is **very wide**; safer but profits per move may be slower to realize.")
+    # Range interpretation from core.grid_engine
+    comments.append(describe_grid_width(lower_price, upper_price))
 
     # TP / SL comments
     if tp > 0 and tp <= upper_price:
@@ -706,6 +729,11 @@ def page_my_bot_notes(usdt_inr: float):
         total_pnl_usdt = 0.0
         total_pnl_inr = 0.0
 
+    # Store in session for daily summary
+    st.session_state["bot_total_cap"] = total_cap
+    st.session_state["bot_total_pnl_usdt"] = total_pnl_usdt
+    st.session_state["bot_total_pnl_inr"] = total_pnl_inr
+
     st.markdown("### 💰 Total Capital & Approx Unrealized P&L (All Logged Bots)")
     cap_table = pd.DataFrame(
         [
@@ -736,11 +764,11 @@ def page_configuration():
 
     st.markdown(
         "Configure Telegram to receive **Dip Alerts** when BTC / ETH / SOL enter "
-        "**Buy on Dips / Oversold** zones (RSI ≤ 35)."
+        "**Buy on Dips / Oversold** zones (RSI ≤ 35) and a **Daily Summary**."
     )
 
     alerts_enabled = st.checkbox(
-        "Enable Telegram Dip Alerts (BTC / ETH / SOL)",
+        "Enable Telegram Dip Alerts + Daily Summary (BTC / ETH / SOL)",
         value=st.session_state.get("alerts_enabled", False),
     )
     st.session_state["alerts_enabled"] = alerts_enabled
@@ -762,6 +790,7 @@ def page_configuration():
         {"Field": "Alerts", "Value": "Enabled" if alerts_enabled else "Disabled"},
         {"Field": "Bot Token", "Value": "●●●●●●●●●●" if token else "Not set"},
         {"Field": "Chat ID", "Value": chat_id or "Not set"},
+        {"Field": "Last Daily Summary Date", "Value": st.session_state.get("last_daily_summary_date") or "Not sent"},
     ]
     cfg_df = pd.DataFrame(cfg_rows)
     st.markdown("### 🔎 Config Snapshot")
@@ -774,7 +803,7 @@ def page_configuration():
             resp = send_telegram_message(
                 token,
                 chat_id,
-                "✅ Test message from AI Crypto Grid Helper – dip alerts configured.",
+                "✅ Test message from AI Crypto Grid Helper – dip alerts & daily summary configured.",
             )
             st.success("Test message triggered. Check your Telegram.")
             if resp is not None:
