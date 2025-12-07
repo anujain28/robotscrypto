@@ -1,0 +1,34 @@
+# Python cache & compiled
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+venv/
+.venv/
+env/
+.conda/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
+
+# Local config / secrets
+config.json
+*.env
+.env.*
+secrets.json
+
+# Logs
+*.log
+
+# VS Code / IDE
+.vscode/
+.idea/
+*.iml
+
+# Jupyter (if ever used)
+.ipynb_checkpoints/
